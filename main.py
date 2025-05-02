@@ -16,13 +16,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 불용어 리스트
 STOPWORDS = set([
     "진짜", "정말", "안녕하세요", "이번", "이제", "여기", "그냥", "맛있게", "또한", "그리고", 
     "하는", "해서", "하게", "것을", "이런", "저런", "합니다", "했다", "있다", "없다", "입니다"
 ])
 
-def extract_text_from_url(url: str):
+def extract_text_and_media(url: str):
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers, timeout=10)
     soup = BeautifulSoup(response.text, "html.parser")
@@ -39,7 +38,8 @@ def extract_text_from_url(url: str):
     for selector in selectors:
         content = soup.select_one(selector)
         if content:
-            return content.get_text(separator=" ", strip=True), soup
+            text = content.get_text(separator=" ", strip=True)
+            return text, soup
     return soup.get_text(), soup
 
 def filter_keywords(words):
@@ -48,48 +48,60 @@ def filter_keywords(words):
 def extract_keywords(text):
     words = re.findall(r"[가-힣]{2,}", text)
     filtered = filter_keywords(words)
-    return Counter(filtered).most_common(30)
+    return filtered, Counter(filtered).most_common(30)
 
-def extract_compound_keywords(words):
-    compound_2 = Counter()
-    compound_3 = Counter()
-    for i in range(len(words)):
-        if i + 1 < len(words):
-            pair = f"{words[i]} {words[i+1]}"
-            compound_2[pair] += 1
-        if i + 2 < len(words):
-            triple = f"{words[i]} {words[i+1]} {words[i+2]}"
-            compound_3[triple] += 1
-    return compound_2.most_common(5), compound_3.most_common(5)
+def extract_combinations(filtered):
+    combo2 = Counter()
+    combo3 = Counter()
+    for i in range(len(filtered)):
+        if i + 1 < len(filtered):
+            combo2[f"{filtered[i]} {filtered[i+1]}"] += 1
+        if i + 2 < len(filtered):
+            combo3[f"{filtered[i]} {filtered[i+1]} {filtered[i+2]}"] += 1
+    return combo2.most_common(5), combo3.most_common(5)
 
-def count_media(soup):
+def count_media(soup, text):
     return {
         "images": len(soup.select("img")),
         "videos": len(soup.select("video")),
         "gifs": len([img for img in soup.select("img") if '.gif' in img.get("src", "")]),
-        "stickers": len(soup.select("span.se-emoticon"))  # 네이버 스티커는 이런 식으로 표현됨
+        "stickers": len(soup.select("span.se-emoticon")),
+        "text_length": len(text)
     }
 
-@app.get("/analyze")
-def analyze(url: HttpUrl = Query(...)):
+def analyze_single(url: str):
     try:
-        raw_text, soup = extract_text_from_url(str(url))
-        words = re.findall(r"[가-힣]{2,}", raw_text)
-        filtered = filter_keywords(words)
-
-        keyword_counts = Counter(filtered).most_common(30)
-        combo2, combo3 = extract_compound_keywords(filtered)
-        media = count_media(soup)
-
-        summary = "이 블로그는 '" + (combo2[0][0] if combo2 else "") + "' 및 '" + (combo3[0][0] if combo3 else "") + "' 키워드를 중심으로 작성된 것으로 보입니다."
-
+        text, soup = extract_text_and_media(url)
+        filtered, keywords = extract_keywords(text)
+        combos2, combos3 = extract_combinations(filtered)
+        media = count_media(soup, text)
         return {
             "url": url,
-            "summary": summary,
-            "keywords": [{"word": w, "count": c} for w, c in keyword_counts],
-            "combos_2": [{"phrase": w, "count": c} for w, c in combo2],
-            "combos_3": [{"phrase": w, "count": c} for w, c in combo3],
+            "keywords": keywords,
+            "combos_2": combos2,
+            "combos_3": combos3,
             "media": media
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"url": url, "error": str(e)}
+
+@app.get("/analyze")
+def analyze(url1: str = "", url2: str = "", url3: str = ""):
+    urls = [url for url in [url1, url2, url3] if url.strip()]
+    results = [analyze_single(url) for url in urls]
+
+    all_keywords = [set(k for k, _ in r["keywords"]) for r in results if "keywords" in r]
+    all_combos2 = [set(k for k, _ in r["combos_2"]) for r in results if "combos_2" in r]
+    all_combos3 = [set(k for k, _ in r["combos_3"]) for r in results if "combos_3" in r]
+
+    common_keywords = list(set.intersection(*all_keywords)) if len(all_keywords) > 1 else []
+    common_combos = list(set.intersection(*all_combos2, *all_combos3)) if len(all_combos2 + all_combos3) > 1 else []
+
+    summary = f"총 {len(results)}개의 블로그 글을 분석했고, 공통 키워드는 {', '.join(common_keywords[:5])} 등이 있습니다."
+
+    return {
+        "summary": summary,
+        "common_keywords": common_keywords[:10],
+        "common_combos": common_combos[:10],
+        "each": results
+    }
